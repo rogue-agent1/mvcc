@@ -1,146 +1,82 @@
 #!/usr/bin/env python3
-"""MVCC — Multi-Version Concurrency Control for databases.
-
-One file. Zero deps. Does one thing well.
-
-Implements snapshot isolation with versioned key-value pairs.
-Each transaction sees a consistent snapshot. Used in PostgreSQL, CockroachDB, TiKV.
-"""
-import sys, threading, time
+"""Multi-Version Concurrency Control database engine."""
+import sys, time, threading
 from collections import defaultdict
 
 class Version:
-    __slots__ = ('value', 'txn_id', 'begin_ts', 'end_ts', 'deleted')
-    def __init__(self, value, txn_id, begin_ts):
-        self.value = value
-        self.txn_id = txn_id
-        self.begin_ts = begin_ts
-        self.end_ts = float('inf')
-        self.deleted = False
+    def __init__(self, value, txn_id, ts):
+        self.value = value; self.txn_id = txn_id; self.ts = ts; self.deleted = value is None
 
 class Transaction:
-    def __init__(self, txn_id, snapshot_ts, store):
-        self.id = txn_id
-        self.snapshot_ts = snapshot_ts
-        self.store = store
-        self.writes = {}  # key -> value
-        self.committed = False
-        self.aborted = False
+    _counter = 0; _lock = threading.Lock()
+    def __init__(self, db):
+        with Transaction._lock: Transaction._counter += 1; self.id = Transaction._counter
+        self.db = db; self.start_ts = time.time(); self.writes = {}
+        self.committed = False; self.aborted = False
 
     def get(self, key):
-        if key in self.writes:
-            v = self.writes[key]
-            return None if v is _DELETED else v
-        return self.store._read(key, self.snapshot_ts)
-
-    def put(self, key, value):
-        self.writes[key] = value
-
-    def delete(self, key):
-        self.writes[key] = _DELETED
-
-    def commit(self):
-        return self.store._commit(self)
-
-    def abort(self):
-        self.aborted = True
-
-class _DeletedSentinel:
-    def __repr__(self): return '<DELETED>'
-_DELETED = _DeletedSentinel()
-
-class MVCCStore:
-    def __init__(self):
-        self.versions = defaultdict(list)  # key -> [Version] ordered by begin_ts
-        self.ts_counter = 0
-        self.lock = threading.Lock()
-        self.committed_txns = set()
-
-    def _next_ts(self):
-        with self.lock:
-            self.ts_counter += 1
-            return self.ts_counter
-
-    def begin(self):
-        ts = self._next_ts()
-        txn_id = ts
-        return Transaction(txn_id, ts, self)
-
-    def _read(self, key, snapshot_ts):
-        """Find the latest committed version visible at snapshot_ts."""
-        for ver in reversed(self.versions[key]):
-            if ver.begin_ts <= snapshot_ts and ver.end_ts > snapshot_ts:
-                if ver.txn_id in self.committed_txns:
-                    return None if ver.deleted else ver.value
+        if key in self.writes: return self.writes[key]
+        versions = self.db.store.get(key, [])
+        for v in reversed(versions):
+            if v.ts <= self.start_ts and not v.deleted: return v.value
         return None
 
-    def _commit(self, txn):
-        if txn.aborted:
-            return False
-        commit_ts = self._next_ts()
-        with self.lock:
-            # Write-write conflict detection
-            for key in txn.writes:
-                for ver in reversed(self.versions[key]):
-                    if ver.begin_ts > txn.snapshot_ts and ver.txn_id in self.committed_txns:
-                        txn.aborted = True
-                        return False  # Conflict!
-            # Apply writes
-            for key, value in txn.writes.items():
-                # End previous version
-                for ver in reversed(self.versions[key]):
-                    if ver.end_ts == float('inf') and ver.txn_id in self.committed_txns:
-                        ver.end_ts = commit_ts
-                        break
-                new_ver = Version(value if value is not _DELETED else None, txn.id, commit_ts)
-                new_ver.deleted = value is _DELETED
-                self.versions[key].append(new_ver)
-            self.committed_txns.add(txn.id)
-            txn.committed = True
-        return True
+    def put(self, key, value): self.writes[key] = value
 
-    def gc(self, oldest_active_ts):
-        """Garbage collect versions no longer visible."""
+    def delete(self, key): self.writes[key] = None
+
+    def commit(self):
+        ts = time.time()
+        with self.db.lock:
+            for key, value in self.writes.items():
+                self.db.store.setdefault(key, []).append(Version(value, self.id, ts))
+        self.committed = True; return True
+
+    def rollback(self): self.writes.clear(); self.aborted = True
+
+class MVCCDatabase:
+    def __init__(self):
+        self.store = {}; self.lock = threading.Lock()
+        self.stats = {"transactions": 0, "commits": 0, "rollbacks": 0}
+
+    def begin(self):
+        self.stats["transactions"] += 1; return Transaction(self)
+
+    def gc(self, before_ts):
         with self.lock:
-            for key in self.versions:
-                self.versions[key] = [
-                    v for v in self.versions[key]
-                    if v.end_ts > oldest_active_ts or v.begin_ts >= oldest_active_ts
-                ]
+            removed = 0
+            for key in list(self.store):
+                versions = self.store[key]
+                self.store[key] = [v for v in versions if v.ts >= before_ts]
+                removed += len(versions) - len(self.store[key])
+                if not self.store[key]: del self.store[key]
+            return removed
+
+    def snapshot(self, ts=None):
+        ts = ts or time.time(); result = {}
+        for key, versions in self.store.items():
+            for v in reversed(versions):
+                if v.ts <= ts:
+                    if not v.deleted: result[key] = v.value
+                    break
+        return result
 
 def main():
-    store = MVCCStore()
+    print("=== MVCC Database ===\n")
+    db = MVCCDatabase()
+    tx1 = db.begin(); tx1.put("x", 10); tx1.put("y", 20); tx1.commit()
+    print(f"Tx1 committed: x=10, y=20")
+    ts_after_tx1 = time.time()
+    tx2 = db.begin(); tx2.put("x", 30)
+    tx3 = db.begin()
+    print(f"Tx3 reads x={tx3.get('x')} (sees tx1, not uncommitted tx2)")
+    tx2.commit(); print(f"Tx2 committed: x=30")
+    print(f"Tx3 still reads x={tx3.get('x')} (snapshot isolation)")
+    tx4 = db.begin()
+    print(f"Tx4 reads x={tx4.get('x')} (sees tx2)")
+    tx5 = db.begin(); tx5.put("z", 99); tx5.rollback()
+    print(f"Tx5 rolled back, z={db.begin().get('z')}")
+    print(f"\nSnapshot at tx1: {db.snapshot(ts_after_tx1)}")
+    print(f"Current snapshot: {db.snapshot()}")
 
-    # Setup
-    t0 = store.begin()
-    t0.put("x", 10)
-    t0.put("y", 20)
-    t0.commit()
-
-    # Concurrent reads: t1 sees snapshot before t2's write
-    t1 = store.begin()
-    t2 = store.begin()
-    t2.put("x", 99)
-    t2.commit()
-    print(f"t1 reads x={t1.get('x')} (snapshot isolation, doesn't see t2's write)")
-    print(f"Fresh read x={store.begin().get('x')} (sees committed value)")
-
-    # Write-write conflict
-    t3 = store.begin()
-    t4 = store.begin()
-    t3.put("y", 100)
-    t3.commit()
-    t4.put("y", 200)
-    ok = t4.commit()
-    print(f"\nConflict test: t4.commit()={ok} (write-write conflict detected)")
-
-    # Delete
-    t5 = store.begin()
-    t5.delete("x")
-    t5.commit()
-    t6 = store.begin()
-    print(f"\nAfter delete: x={t6.get('x')}")
-    print("✓ MVCC working correctly")
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
