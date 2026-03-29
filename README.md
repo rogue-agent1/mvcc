@@ -1,13 +1,9 @@
-# MVCC Database
+# mvcc-engine
 
-MVCC Database — zero-dependency, single-file Python CLI.
+Multi-Version Concurrency Control engine. Single-file Python CLI, zero dependencies.
 
 ## Usage
 
 ```bash
-python3 mvcc.py --help
+python3 mvcc.py
 ```
-
-## License
-
-MIT
