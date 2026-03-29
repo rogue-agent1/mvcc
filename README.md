@@ -1,19 +1,11 @@
-# MVCC Engine
+# mvcc
 
-Multi-Version Concurrency Control with snapshot isolation
+Multi-Version Concurrency Control for snapshot isolation.
 
 ## Usage
 
 ```bash
-python3 mvcc.py --help
+python3 mvcc.py test
 ```
 
-## Features
-
-- Zero dependencies (Python 3.8+ stdlib only)
-- Single file
-- CLI interface
-
-## License
-
-MIT
+Zero dependencies. Python 3.8+.
